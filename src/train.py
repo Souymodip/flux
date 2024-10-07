@@ -1,30 +1,22 @@
 import torch
 from torch import Tensor
 from einops import rearrange, repeat
-from flux.model import Flux, FluxParams
 from flux.modelImg import FluxImg, FluxImgParams
-from flux.modules.conditioner import HFEmbedder
 from flux.sampling import denoise, get_schedule
 from flux.modules.layers import EmbedND
 import math
 
-device = torch.device("cuda" if torch.cuda.is_available() else "mps")
+device = torch.device("cuda") if torch.cuda.is_available() else (torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu"))
 dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 feature_size = 2
-height = 32
-width = 32
-
-
-def get_t5(max_length=256):
-    return HFEmbedder("google-t5/t5-small", max_length=max_length, torch_dtype=dtype)
-
-
-def get_clip(max_length=77):
-    return HFEmbedder("openai/clip-vit-base-patch16", max_length=max_length, torch_dtype=dtype)
-
+H = 32
+W = 32
+in_channels = 1
+cond_channels = 3
 
 params_img=FluxImgParams(
-            in_channels=feature_size*feature_size,
+            in_channels=feature_size*feature_size * in_channels,
+            cond_channels=feature_size*feature_size * cond_channels,
             hidden_size=1024,
             mlp_ratio=4.0,
             num_heads=8,
@@ -32,24 +24,8 @@ params_img=FluxImgParams(
             depth_single_blocks=14,
             axes_dim=[16, 56, 56],
             theta=10_000,
-            height=height,
-            width=width,
-            qkv_bias=True,
-            guidance_embed=False,
-        )
-
-
-params = FluxParams(
-            in_channels=feature_size*feature_size,
-            vec_in_dim=512,
-            context_in_dim=512,
-            hidden_size=1024,
-            mlp_ratio=4.0,
-            num_heads=8,
-            depth=7,
-            depth_single_blocks=14,
-            axes_dim=[16, 56, 56],
-            theta=10_000,
+            height=H,
+            width=W,
             qkv_bias=True,
             guidance_embed=False,
         )
@@ -65,13 +41,23 @@ def get_noise(
 ):
     return torch.randn(
         num_samples,
-        1,
-        # allow for packing
-        feature_size * math.ceil(height / feature_size),
-        feature_size * math.ceil(width / feature_size),
+        in_channels,
+        height,
+        width,
         device=device,
         dtype=dtype,
         generator=torch.Generator(device=device).manual_seed(seed),
+    )
+
+
+def unpack(x: Tensor, height: int, width: int) -> Tensor:
+    return rearrange(
+        x,
+        "b (h w) (c ph pw) -> b c (h ph) (w pw)",
+        h=math.ceil(height / feature_size),
+        w=math.ceil(width / feature_size),
+        ph=2,
+        pw=2,
     )
 
 
@@ -92,22 +78,6 @@ def main(inp, timesteps, model, pe):
     print(f'Output Shape: {pred.shape}, Unpacked Shape: {nx.shape}')
 
 
-def main2(inp, timesteps, model):
-    x = denoise(model, **inp, timesteps=timesteps, guidance=4)
-    print(f'Output Shape: {x.shape}')
-
-
-def unpack(x: Tensor, height: int, width: int) -> Tensor:
-    return rearrange(
-        x,
-        "b (h w) (c ph pw) -> b c (h ph) (w pw)",
-        h=math.ceil(height / feature_size),
-        w=math.ceil(width / feature_size),
-        ph=2,
-        pw=2,
-    )
-
-
 def prepare_img(img:Tensor, img_cond:Tensor):
     assert img_cond.shape == img.shape, f'Image and Image Conditioner shape mismatch: {img.shape} != {img_cond.shape}'
 
@@ -120,39 +90,8 @@ def prepare_img(img:Tensor, img_cond:Tensor):
     }
 
 
-def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, prompt: str | list[str]) -> dict[str, Tensor]:
-    import pdb; pdb.set_trace()
-    bs, c, h, w = img.shape
-    if bs == 1 and not isinstance(prompt, str):
-        bs = len(prompt)
-
-    img = rearrange(img, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=feature_size, pw=feature_size)
-    if img.shape[0] == 1 and bs > 1:
-        img = repeat(img, "1 ... -> bs ...", bs=bs)
-
-    img_ids = torch.zeros(h // feature_size, w // feature_size, 3)
-    img_ids[..., 1] = img_ids[..., 1] + torch.arange(h // feature_size)[:, None]
-    img_ids[..., 2] = img_ids[..., 2] + torch.arange(w // feature_size)[None, :]
-    img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs)
-
-    if isinstance(prompt, str):
-        prompt = [prompt]
-    txt = t5(prompt)
-    if txt.shape[0] == 1 and bs > 1:
-        txt = repeat(txt, "1 ... -> bs ...", bs=bs)
-    txt_ids = torch.zeros(bs, txt.shape[1], 3)
-
-    vec = clip(prompt)
-    if vec.shape[0] == 1 and bs > 1:
-        vec = repeat(vec, "1 ... -> bs ...", bs=bs)
-
-    return {
-        "img": img,
-        "img_ids": img_ids.to(img.device),
-        "txt": txt.to(img.device),
-        "txt_ids": txt_ids.to(img.device),
-        "vec": vec.to(img.device),
-    }
+def pack(x):
+    return rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=feature_size, pw=feature_size)
 
 
 def get_pe(height:int, width:int, batch_size: int,
@@ -169,46 +108,105 @@ def get_pe(height:int, width:int, batch_size: int,
     return pe_embedder(ids)
 
 
-def run_denoise():
-    t5 = get_t5()
-    clip = get_clip()
-    img = get_noise(1, 32, 32, device=device, dtype=dtype, seed=1)
-    prompt = "one"
-    inp = prepare(t5, clip, img, prompt)
+def get_pe2(height:int, width:int, batch_size: int,
+                pe_dim: int, theta:int, axes_dim: list[int]) -> Tensor:
+    ids0 = torch.zeros(height//feature_size, width//feature_size, 3)
+    ids0[..., 1] = ids0[..., 1] + torch.arange(height//feature_size)[:, None]
+    ids0[..., 2] = ids0[..., 2] + torch.arange(width//feature_size)[None, :]
+    ids0 = repeat(ids0, "h w c -> b (h w) c", b=batch_size)
 
-    timesteps = get_schedule(4, inp["img"].shape[1], shift=False)
-    model = Flux(params)
-    print(f'Image Shape: {inp["img"].shape},\n'
-          f'Timesteps: {timesteps},\n'
-          f'T5 Shape: {inp["txt"].shape}\n'
-          f'Clip Shape: {inp["vec"].shape}\n'
-          f'Image IDs Shape: {inp["img_ids"].shape}\n'
-          f'Text IDs Shape: {inp["txt_ids"].shape}\n')
-    x = denoise(model, **inp, timesteps=timesteps, guidance=4)
-    print(f'Output Shape: {x.shape}')
+    ids1 = torch.zeros(height//feature_size, width//feature_size, 3)
+    ids1[..., 1] = ids1[..., 1] + torch.arange(height//feature_size, 2*height//feature_size)[:, None]
+    ids1[..., 2] = ids1[..., 2] + torch.arange(width//feature_size, 2*width//feature_size)[None, :]
+    ids1 = repeat(ids1, "h w c -> b (h w) c", b=batch_size)
+
+    ids = torch.cat((ids0, ids1), dim=1)
+    print(f'Positional Encoding IDs Shape: {ids.shape} -> {ids0.shape} + {ids1.shape}')
+
+    pe_embedder = EmbedND(dim=pe_dim, theta=theta, axes_dim=axes_dim)
+    return pe_embedder(ids)
+
+
+def get_ts(batch_size, is_stratified, device):
+    if is_stratified:
+        quantiles = torch.linspace(0, 1, batch_size + 1).to(device)
+        z = quantiles[:-1] + torch.rand((batch_size,)).to(device) / batch_size
+        z = torch.erfinv(2 * z - 1) * math.sqrt(2)
+        t = torch.sigmoid(z)
+    else:
+        nt = torch.randn((batch_size,)).to(device)
+        t = torch.sigmoid(nt)
+    return t
+
+
+def forward(model:FluxImg, x, y, rope, guidance):
+    assert x.ndim == 3, f'Expected 3D Tensor, got {x.ndim}D Tensor'
+    assert x.device == rope.device, f'Image and Positional Encoding device mismatch: {x.device} != {rope.device}'
+
+    b, n, d = x.shape
+    ts = get_ts(b, True, x.device)
+    texp = ts.view([b, *([1] * len(x.shape[1:]))])
+    z1 = torch.randn_like(x)
+    zt = (1 - texp) * x + texp * z1
+
+    zt = zt.to(x.device)
+    vtheta = model(img=zt, img_cond=y, pe=rope, timesteps=ts, guidance=guidance)
+    batchwise_mse = ((z1 - x - vtheta) ** 2).mean(dim=list(range(1, len(x.shape))))
+    loss = batchwise_mse.mean()
+
+    tlist = batchwise_mse.detach().cpu().reshape(-1).tolist()
+    ttloss = [(tv, tloss) for tv, tloss in zip(ts, tlist)]
+    return loss, ttloss
+
+
+def get_random_imgs(batch_size, height, width, channels, device, dtype):
+    seed = torch.randint(0, 1000, (1,)).item()
+    # img = get_noise(batch_size, height, width, device=device, dtype=dtype, seed=seed)
+    img = torch.randn(
+        batch_size,
+        channels,
+        # allow for packing
+        feature_size * math.ceil(height / feature_size),
+        feature_size * math.ceil(width / feature_size),
+        device=device,
+        dtype=dtype,
+        generator=torch.Generator(device=device).manual_seed(seed),
+    )
+    return img
+
+
 
 
 def run():
     rng = torch.Generator(device="cpu")
     seed = rng.seed()
-    x = get_noise(1, height, width, device=device, dtype=dtype, seed=seed)
-    img_cond = get_noise(1, height, width, device=device, dtype=dtype, seed=seed)
+    # x = get_noise(16, H, W, device=device, dtype=dtype, seed=seed)
+    img_cond = get_noise(16, H, W, device=device, dtype=dtype, seed=seed)
 
     model = FluxImg(params_img)
-    import pdb; pdb.set_trace()
 
-    inp = prepare_img(x, img_cond)
-    timesteps = get_schedule(4, inp["img"].shape[1], shift=False)
+    # timesteps = get_schedule(4, inp["img"].shape[1], shift=False)
 
     pe_dim = params_img.hidden_size // params_img.num_heads
-    pe = get_pe(height, width, 1, pe_dim, params_img.theta, params_img.axes_dim)
+    pe = get_pe2(H, W, 16, pe_dim, params_img.theta, params_img.axes_dim)
 
-    print(f'Input Shape: {inp["img"].shape},\n'
-          f'Timesteps: {timesteps},\n'
-          f'Image Conditioner Shape: {inp["img_cond"].shape}\n'
+    x = get_random_imgs(16, H, W, in_channels, device, dtype)
+    y = get_random_imgs(16, H, W, cond_channels, device, dtype)
+    token_x = pack(x)
+    token_y = pack(y)
+    # inp = prepare_img(x, img_cond)
+
+    print(f'token_x Shape: {token_x.shape}\n'
+          f'token_y Shape: {token_y.shape}\n'
           f'Positional Encoding Shape: {pe.shape}\n')
 
-    main(inp, timesteps, model, pe)
+    model = model.to(device)
+    token_x = token_x.to(device)
+    pe = pe.to(device)
+
+    loss, ttloss = forward(model, token_x, token_y, pe, 4.0)
+    print(f'Loss: {loss}')
+    # main(inp, timesteps, model, pe)
 
 
 if __name__ == "__main__":
