@@ -2,7 +2,6 @@ import torch
 from torch import Tensor
 from einops import rearrange, repeat
 from flux.modelImg import FluxImg, FluxImgParams
-from flux.sampling import denoise, get_schedule
 from flux.modules.layers import EmbedND
 import math
 
@@ -59,6 +58,23 @@ def unpack(x: Tensor, height: int, width: int) -> Tensor:
         ph=2,
         pw=2,
     )
+
+
+def denoise(model:FluxImg, x:Tensor, y:Tensor, pe:Tensor, guidance, timesteps:list[float]):
+    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+        t_vec = torch.full((x.shape[0],), t_curr, dtype=x.dtype, device=x.device)
+        v = model(img=x, img_cond=y, pe=pe, timesteps=t_vec, guidance=guidance)
+        x = x + v * ( t_prev - t_curr)
+    return x
+
+
+def generate(model:FluxImg, y:Tensor, pe:Tensor, guidance:float,
+             timesteps:list[float], seed:int) -> Tensor:
+    x = get_noise(16, H, W, device, dtype, seed=seed)
+    x = denoise(model, x, y, pe, guidance, timesteps)
+    return x
+
+
 
 
 def main(inp, timesteps, model, pe):
@@ -175,8 +191,6 @@ def get_random_imgs(batch_size, height, width, channels, device, dtype):
     return img
 
 
-
-
 def run():
     rng = torch.Generator(device="cpu")
     seed = rng.seed()
@@ -204,7 +218,9 @@ def run():
     token_x = token_x.to(device)
     pe = pe.to(device)
 
-    loss, ttloss = forward(model, token_x, token_y, pe, 4.0)
+    guidance = 4.0
+    guidance_vec = torch.full((token_x.shape[0],), guidance, device=token_x.device, dtype=token_x.dtype)
+    loss, ttloss = forward(model, token_x, token_y, pe, guidance_vec)
     print(f'Loss: {loss}')
     # main(inp, timesteps, model, pe)
 

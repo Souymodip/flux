@@ -1,9 +1,8 @@
 from dataclasses import dataclass
-from einops import repeat
 import torch
 from torch import Tensor, nn
 
-from flux.modules.layers import (DoubleStreamBlock, EmbedND, LastLayer,
+from flux.modules.layers import (DoubleStreamBlock, LastLayer,
                                  MLPEmbedder, SingleStreamBlock,
                                  timestep_embedding)
 
@@ -89,7 +88,7 @@ class FluxImg(nn.Module):
         timesteps: Tensor,
         guidance: Tensor | None = None,
     ) -> Tensor:
-        print(f'-img shape: {img.shape}, txt shape: {img_cond.shape}')
+        # print(f'-img shape: {img.shape}, txt shape: {img_cond.shape}')
         if img.ndim != 3 or img_cond.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
@@ -103,7 +102,7 @@ class FluxImg(nn.Module):
             vec = vec + self.guidance_in(timestep_embedding(guidance, 256))
 
         img_cond = self.img_cond_in(img_cond)
-        print(f'\tpe shape: {pe.shape}, img shape: {img.shape}, txt shape: {img_cond.shape}')
+        # print(f'\tpe shape: {pe.shape}, img shape: {img.shape}, txt shape: {img_cond.shape}')
         for block in self.double_blocks:
             img, img_cond = block(img=img, txt=img_cond, vec=vec, pe=pe)
 
