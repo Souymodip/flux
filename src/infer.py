@@ -1,6 +1,6 @@
 import torch
 from torch import Tensor
-from einops import rearrange
+from einops import rearrange, repeat
 from flux.model import Flux, FluxParams
 from flux.modules.conditioner import HFEmbedder
 from flux.sampling import denoise, get_schedule, prepare
@@ -113,5 +113,108 @@ def run_denoise():
     print(f'Output Shape: {x.shape}')
 
 
+@torch.no_grad()
+def test_model_img():
+    head = '/Users/souymodip/GIT/pythonProject/'
+    val_path = f'{head}/data0'
+    ckpt_path ='/Users/souymodip/GIT/flux/CKPT/checkpoints/epoch=124-step=128000.ckpt'
+    from dl import get_train_loader
+    import lt
+    from flux.modelImg import FluxImg
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import os
+    from tqdm import tqdm
+
+    fparams = lt.fparams
+    train_params = lt.train_params
+    train_loader = get_train_loader(folder_path=val_path, size=32,
+                                    batch_size=1, num_workers=4, dtype=torch.float32)
+    print(f'Number of mini batche: {len(train_loader)}')
+
+    rf = lt.RF.load_from_checkpoint(ckpt_path, model=FluxImg(fparams), fluxparams=fparams, trainparams=train_params)
+    rf.setup("eval")
+    rf.model.eval()
+
+    def to_img(l):
+        l = l - l.min()
+        l = l / l.max()
+        return rf.unpack(l).permute(0, 2, 3, 1).squeeze(0).cpu().numpy()
+
+    def prepare(in_img, out_img, timestep:float):
+        # z1 = torch.randn_like(out_img)
+        token_y = rf.pack(in_img)  # b, 3, H, W
+        token_x = rf.pack(out_img)  # b, 1, H, W
+        token_z1 = torch.randn_like(token_x) #rf.pack(z1)  # b, 1, H, W
+
+        b, n, d = token_x.shape
+        ts = torch.tensor([timestep], dtype=token_x.dtype, device=token_x.device)
+        texp = ts.view([b, *([1] * len(token_x.shape[1:]))])
+
+        pe = repeat(rf.pe, "... -> b ...", b=b).squeeze(1)
+
+        zt = (1 - texp) * token_x + texp * token_z1
+        return token_z1, token_x, zt, token_y, ts, pe
+
+    for x, y in train_loader:
+        print(f'x Shape: {x.shape}, range: [{x.min()}, {x.max()}]\n'
+              f'y Shape: {y.shape}, range: [{y.min()}, {y.max()}]')
+
+        timesteps = torch.linspace(1, 0, 500)
+        timesteps = torch.sigmoid(11*(timesteps - 0.5))
+
+        token_z1, token_x, _, token_y, _, pe = prepare(x, y, 0.99)
+        z1 = token_z1.clone()
+
+        folder = 'output'
+        os.makedirs('output', exist_ok=True)
+        img_paths = []
+        losses = []
+
+        token_x_img = to_img(token_x)
+        token_y_img = to_img(token_y)
+
+        device = torch.device("mps")
+        rf = rf.to(device)
+        token_y = token_y.to(device)
+        token_x = token_x.to(device)
+        token_z1 = token_z1.to(device)
+        z1 = z1.to(device)
+        pe = pe.to(device)
+        for i in tqdm(range(len(timesteps) - 1)):
+            t_vec = torch.full((token_x.shape[0],), timesteps[i], dtype=token_x.dtype, device=token_x.device)
+            v = rf.model(img=z1, img_cond=token_y, pe=pe, timesteps=t_vec)
+
+            loss = ((token_z1 - token_x - v) ** 2).mean()
+            losses.append(loss.item())
+            # import pdb; pdb.set_trace()
+            z1 = z1 + v * (timesteps[i+1] - timesteps[i])
+
+            if i % 10 == 0 or i == len(timesteps) - 2:
+                fig, (ax1, ax2, ax3) = plt.subplots(1, 3, tight_layout=True)
+                ax1.imshow(to_img(z1))
+                ax2.imshow(token_x_img)
+                ax3.imshow(token_y_img)
+                fig.suptitle(f'Timestep: {timesteps[i] :.3f}, loss: {losses[-1]:.3f}')
+                plt.savefig(os.path.join(folder, f'{i}.png'))
+                plt.close()
+                img_paths.append(os.path.join(folder, f'{i}.png'))
+
+        plt.plot(losses)
+        plt.savefig(os.path.join(folder, 'loss.png'))
+        plt.close()
+
+        # convert images to gif
+        import imageio
+        images = [imageio.v2.imread(img_path) for img_path in img_paths]
+        imageio.mimsave('output/output.gif', images)
+
+        # z1, zt, token_y, token_x, ts, pe = rf.prepare((x, y), 0)
+        # vtheta = rf.model(img=zt, img_cond=token_y, pe=pe, timesteps=ts)
+
+        break
+
+
 if __name__ == "__main__":
-    run_denoise()
+    # run_denoise()
+    test_model_img()

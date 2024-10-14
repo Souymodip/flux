@@ -120,6 +120,7 @@ class RF(l.LightningModule):
                          self.fparams.theta, self.fparams.axes_dim)
         self.pe.requires_grad = False
         self.pe = self.pe.to(self.tparams.device)
+        # import pdb; pdb.set_trace()
 
     def pack(self, x):
         return rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)",
@@ -158,6 +159,7 @@ class RF(l.LightningModule):
         return z1, zt, token_y, token_x, ts, pe
 
     def training_step(self, batch, batch_idx):
+        assert self.model.training, "Model is not in training!"
         z1, zt, token_y, token_x, ts, pe = self.prepare(batch, batch_idx)
 
         vtheta = self.model(img=zt, img_cond=token_y, pe=pe, timesteps=ts)
@@ -178,15 +180,15 @@ class RF(l.LightningModule):
             loss = batchwise_mse.mean()
             self.log('val_loss', loss.item(), prog_bar=True, sync_dist=True)
 
-            if epoch % 10 == 0:
-                tlist = batchwise_mse.detach().cpu().reshape(-1).tolist()
-                bins = ts.detach().cpu().numpy().tolist()
+            # if epoch % 10 == 0:
+            #     tlist = batchwise_mse.detach().cpu().reshape(-1).tolist()
+            #     bins = ts.detach().cpu().numpy().tolist()
 
-                data = list(zip(bins, tlist))
-                table = wandb.Table(data=data, columns=["ts", "loss"])
-                self.logger.experiment.log({f"Losses:{epoch}": wandb.plot.line(
-                    table, "ts", "loss", title=f"time vs loss {epoch}"
-                )})
+            #     data = list(zip(bins, tlist))
+            #     table = wandb.Table(data=data, columns=["ts", "loss"])
+            #     self.logger.experiment.log({f"Losses:{epoch}": wandb.plot.line(
+            #         table, "ts", "loss", title=f"time vs loss {epoch}"
+            #     )})
         return loss
 
     @torch.no_grad()
@@ -204,61 +206,69 @@ class RF(l.LightningModule):
         b, c, h, w = y.shape
         assert c == 3, "Input must be RGB Image"
         assert h == self.tparams.H and w == self.tparams.W, "Input shape must match model input shape"
-        x = get_noise(b, self.tparams.in_channels, h, w, self.tparams.device, torch.float32, seed)
+        x = get_noise(b, self.tparams.in_channels, h, w, y.device, y.dtype, seed)
 
         token_x = self.pack(x)
         token_y = self.pack(y)
 
         if timesteps is None:
             timesteps = torch.linspace(1, 0, 100)
-            timesteps = torch.sigmoid(timesteps)  # do we need this ?
+            timesteps = torch.sigmoid(11 * (timesteps - 0.5))  # do we need this ?
 
         x = self.denoise(token_x, token_y, None, timesteps)
         return self.unpack(x)
 
 
 class GenerateCallback(Callback):
-    def __init__(self, model: RF, imgs: Tensor, out_imgs: Tensor, timesteps: list[float] | None, seed: int):
-        self.model = model
+    def __init__(self, imgs: Tensor, out_imgs: Tensor, timesteps: list[float] | None, seed: int):
         b, c, h, w = imgs.shape
         self.num = 16
-        assert c == 3, "Input must be RGB Image"
-        assert h == self.model.tparams.H and w == self.model.tparams.W, "Input shape must match model input shape"
         self.x = out_imgs[:self.num]
         self.y = imgs[:self.num]  # torchvision.transforms.Normalize(mean=[0.5]*c, std=[0.5]*c)(imgs)
         self.timesteps = timesteps
         self.seed = seed
 
+    @staticmethod
+    def to_img(l: Tensor):
+        # get min value in a batch
+        b, c, h, w = l.shape
+        min_val = l.view(b, -1).min(dim=-1).values.view(b, 1, 1, 1)
+        max_val = l.view(b, -1).max(dim=-1).values.view(b, 1, 1, 1)
+        l = l - min_val
+        l = l / max_val
+        return l.clamp(0, 1)
+
     def on_train_epoch_end(self, trainer, pl_module):
         pl_module.model.eval()
         epoch = trainer.current_epoch
-        if trainer.current_epoch % 10 == 0:
-            y = self.y.to(pl_module.device)
-            out = self.model.generate(y, self.timesteps, self.seed)
-            out = out.cpu().clip(-1, 1) * 0.5 + 0.5
-            y = y.cpu() * 0.5 + 0.5
-            x = self.x.cpu() * 0.5 + 0.5
+        with torch.no_grad():
+            if trainer.current_epoch % 10 == 0:
+                y = self.y.to(pl_module.device)
+                out = pl_module.generate(y, self.timesteps, self.seed)
+                out = self.to_img(out).cpu()
+                y = y.cpu() * 0.5 + 0.5
+                x = self.x.cpu() * 0.5 + 0.5
 
-            out = repeat(out, "b c h w -> b (k c) h w", k=3)
-            x = repeat(x, "b c h w -> b (k c) h w", k=3)
+                out = repeat(out, "b c h w -> b (k c) h w", k=3)
+                x = repeat(x, "b c h w -> b (k c) h w", k=3)
 
-            grid = torch.cat((y, x, out), dim=0)
-            out = torchvision.utils.make_grid(grid, nrow=grid.shape[0] // 3)
-            trainer.logger.experiment.log({f"Gen:{epoch}": wandb.Image(out, caption="Generated Images")})
+                grid = torch.cat((y, x, out), dim=0)
+                out = torchvision.utils.make_grid(grid, nrow=grid.shape[0] // 3)
+                trainer.logger.experiment.log({f"Gen:{epoch}": wandb.Image(out, caption="Generated Images")})
         pl_module.model.train()
 
 
 device = torch.device("cuda") if torch.cuda.is_available() else (
     torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu"))
 dtype = torch.float32  # torch.bfloat16 if torch.cuda.is_available() else torch.float32
-head = '/Users/souymodip/GIT/pythonProject/' # '/home/souchakr/sensei-fs-symlink/users/souchakr/localssd'  # '/Users/souymodip/GIT/pythonProject/'
+head = '/home/souchakr/sensei-fs-symlink/users/souchakr/localssd'  # '/Users/souymodip/GIT/pythonProject/'
 folder_path = f'{head}/data4'
 val_path = f'{head}/data0'
-num_workers = 1
+num_workers = 11  # 1
 
 train_params = TrainParams(
-    batch_size=8,
-    epochs=100,
+    batch_size=24,
+    epochs=420000,
     lr=1e-4,
     H=32,
     W=32,
@@ -288,35 +298,47 @@ fparams = FluxImgParams(
 
 
 def train():
-    rf = RF(FluxImg(fparams), fparams, train_params)
-
     data = dl.get_train_loader(folder_path, train_params.H, train_params.dtype, train_params.batch_size,
                                num_workers=num_workers)
     val = dl.get_val_loader(val_path, train_params.H, train_params.dtype, train_params.batch_size,
                             num_workers=num_workers)
+
     mc = ModelCheckpoint(monitor='train_loss', save_last=True, every_n_epochs=5,
                          filename='s{step:08d}-l{train_loss:.3f}')
 
     x, y = next(iter(val))
     cb = [
         mc,
-        GenerateCallback(rf, x, y, None, 42)
+        GenerateCallback(x, y, None, 42)
     ]
     wandb_logger = WandbLogger(project="DiTEdge")
 
-    trainer = l.Trainer(accelerator="gpu", devices=1, strategy="auto",
-                        max_epochs=3, callbacks=cb,
+    trainer = l.Trainer(accelerator="gpu", devices="auto", strategy="auto",
+                        callbacks=cb,
                         logger=wandb_logger,
-                        limit_train_batches=2, limit_val_batches=2,
-                        val_check_interval=0.5)
-    ckpt_path : str | None = None
+                        # max_epochs=1, limit_train_batches=2, limit_val_batches=2,
+                        # val_check_interval=0.5
+                        )
+
+    ckpt_path = '/sensei-fs/users/souchakr/RF/src/DiTEdge/2pgkchff/checkpoints/epoch=124-step=128000.ckpt'  # '/Users/souymodip/GIT/flux/CKPT/checkpoints/epoch=124-step=128000.ckpt'
     if ckpt_path:
         print(f"Loading Checkpoint from {ckpt_path}")
-        rf = rf.load_from_checkpoint(ckpt_path)
-    trainer.fit(rf, data, val)
+        rf = RF.load_from_checkpoint(ckpt_path, model=FluxImg(fparams), fluxparams=fparams, trainparams=train_params)
+        rf.setup("train")
+    else:
+        rf = RF(FluxImg(fparams), fparams, train_params)
+
+    trainer.fit(rf, data)
     print('Training Completed!')
 
 
 if __name__ == '__main__':
     train()
+
+    # ckpt_path ='/sensei-fs/users/souchakr/RF/src/DiTEdge/2pgkchff/checkpoints/epoch=124-step=128000.ckpt'
+    # if ckpt_path:
+    #     print(f"Loading Checkpoint from {ckpt_path}")
+    #     rf = RF.load_from_checkpoint(ckpt_path, model=FluxImg(fparams), fluxparams=fparams, trainparams=train_params)
+    # import pdb; pdb.set_trace()
+
 
