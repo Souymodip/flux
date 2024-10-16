@@ -9,10 +9,13 @@ from dataclasses import dataclass
 import math
 import torchvision
 import dlSeg as dl
-# import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 from lightning.pytorch.loggers import WandbLogger
 import wandb
 from tqdm import tqdm
+from io import BytesIO
+import numpy as np
+from PIL import Image
 
 torch.set_float32_matmul_precision('medium')
 
@@ -50,6 +53,21 @@ def get_noise(
         dtype=dtype,
         generator=torch.Generator(device=device).manual_seed(seed),
     )
+
+
+def plot_line(x, y, label_x, label_y):
+    fig, ax = plt.subplots(tight_layout=True, figsize=(10, 5))
+    ax.plot(x, y, 'o-')
+    ax.set_xlabel(label_x)
+    ax.set_ylabel(label_y)
+    buf = BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    # create numpy array of buf
+    img = np.array(Image.open(buf))
+    buf.close()
+    plt.close()
+    return img
 
 
 def get_pe(height: int, width: int, batch_size: int, feature_size: int,
@@ -94,7 +112,8 @@ def get_ts(batch_size, is_stratified, device):
         quantiles = torch.linspace(0, 1, batch_size + 1).to(device)
         z = quantiles[:-1] + torch.rand((batch_size,)).to(device) / batch_size
         z = torch.erfinv(2 * z - 1) * math.sqrt(2)
-        t = torch.sigmoid(z)
+        k = torch.randint(low=1, high=4,size=(1,)).item()
+        t = torch.sigmoid(k*z)
     else:
         nt = torch.randn((batch_size,)).to(device)
         t = torch.sigmoid(nt)
@@ -239,7 +258,7 @@ class GenerateCallback(Callback):
 
     @staticmethod
     def get_timesteps():
-        timesteps = torch.linspace(1, 0, 1000)
+        timesteps = torch.linspace(1, 0, 100)
         timesteps = torch.sigmoid(11 * (timesteps - 0.5))
         return timesteps
 
@@ -278,16 +297,16 @@ class GenerateCallback(Callback):
                 grid = torch.cat((y, x, zt_img), dim=0)
                 out = torchvision.utils.make_grid(grid, nrow=grid.shape[0] // 3, pad_value=1)
 
-                # import matplotlib.pyplot as plt
-                # plt.imshow(out.permute(1, 2, 0))
-                # plt.show()
-                # import pdb; pdb.set_trace()
                 trainer.logger.experiment.log({f"Gen:{epoch}": wandb.Image(out, caption="Generated Images")})
-                # log losses plot in wandb
-                trainer.logger.experiment.log({f"Losses:{epoch}": wandb.plot.line(
-                    wandb.Table(data=list(zip(timesteps[:-1], losses)), columns=["ts", "loss"]),
-                    "ts", "loss", title=f"time vs loss {epoch}"
-                )})
+                # # log losses plot in wandb
+                plt_img = plot_line(timesteps[:-1], losses, "Time", "Loss")
+                trainer.logger.experiment.log({f"Losses:{epoch}": wandb.Image(plt_img, caption="Losses Plot")})
+
+
+                # trainer.logger.experiment.log({f"Losses:{epoch}": wandb.plot.line(
+                #     wandb.Table(data=list(zip(timesteps[:-1], losses)), columns=["ts", "loss"]),
+                #     "ts", "loss", title=f"time vs loss {epoch}"
+                # )})
 
         pl_module.model.train()
 
