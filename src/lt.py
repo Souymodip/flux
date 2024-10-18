@@ -10,14 +10,26 @@ import math
 import torchvision
 import dlSeg as dl
 import matplotlib.pyplot as plt
-from lightning.pytorch.loggers import WandbLogger
-import wandb
+# from lightning.pytorch.loggers import WandbLogger
+# import wandb
 from tqdm import tqdm
 from io import BytesIO
 import numpy as np
 from PIL import Image
+from flux.modules.autoencoder import AutoEncoder
+import flux.util as util
+
 
 torch.set_float32_matmul_precision('medium')
+
+
+@torch.no_grad()
+def load_ae(name: str, device: str | torch.device = "cuda", hf_download: bool = True) -> AutoEncoder:
+    ae = util.load_ae(name, device)
+    # iterate over all parameters and set requires_grad to False
+    for param in ae.parameters():
+        param.requires_grad = False
+    return ae
 
 
 @dataclass
@@ -27,6 +39,7 @@ class TrainParams:
     lr: float
     H: int
     W: int
+    Z: int # latent dim
     seed: int
     in_channels: int
     cond_channels: int
@@ -70,7 +83,7 @@ def plot_line(x, y, label_x, label_y):
     return img
 
 
-def get_pe(height: int, width: int, batch_size: int, feature_size: int,
+def get_pe(height: int, width: int, feature_size: int,
            pe_dim: int, theta: int, axes_dim: list[int]) -> Tensor:
     ids0 = torch.zeros(height // feature_size, width // feature_size, 3)
     ids0[..., 1] = ids0[..., 1] + torch.arange(height // feature_size)[:, None]
@@ -107,12 +120,12 @@ def get_random_imgs(batch_size, height, width, channels, feature_size, device, d
     return img
 
 
-def get_ts(batch_size, is_stratified, device):
+def get_ts(batch_size, device, is_stratified, focus_ends):
     if is_stratified:
         quantiles = torch.linspace(0, 1, batch_size + 1).to(device)
         z = quantiles[:-1] + torch.rand((batch_size,)).to(device) / batch_size
         z = torch.erfinv(2 * z - 1) * math.sqrt(2)
-        k = torch.randint(low=1, high=4,size=(1,)).item()
+        k = torch.randint(low=1, high=4,size=(1,)).item() if focus_ends else 1
         t = torch.sigmoid(k*z)
     else:
         nt = torch.randn((batch_size,)).to(device)
@@ -121,29 +134,45 @@ def get_ts(batch_size, is_stratified, device):
 
 
 class RF(l.LightningModule):
-    def __init__(self, model: FluxImg, fluxparams: FluxImgParams, trainparams: TrainParams):
+    def __init__(self, model: FluxImg, vae:AutoEncoder|None,
+                 fluxparams: FluxImgParams, trainparams: TrainParams):
         super(RF, self).__init__()
         self.model: FluxImg = model
         self.fparams: FluxImgParams = fluxparams
         self.tparams: TrainParams = trainparams
-        self.pe = get_pe(self.tparams.H, self.tparams.W, self.tparams.batch_size,
-                         self.tparams.feature_size, self.fparams.hidden_size,
-                         self.fparams.theta, self.fparams.axes_dim)
-        self.pe.requires_grad = False
-        self.pe.to(self.tparams.dtype)
-        self.pe = self.pe.to(self.tparams.device)
+
+        self.pe = None
+        self.vae = vae.eval()
 
     def setup(self, stage: str) -> None:
-        self.pe = get_pe(self.tparams.H, self.tparams.W, self.tparams.batch_size,
-                         self.tparams.feature_size, self.fparams.hidden_size,
+        if self.vae is not None:
+            H, W, F = self.tparams.Z, self.tparams.Z, 1
+        else:
+            H, W, F = self.tparams.H, self.tparams.W, self.tparams.feature_size
+
+        self.pe = get_pe(H, W, F, self.fparams.hidden_size,
                          self.fparams.theta, self.fparams.axes_dim)
+
         self.pe.requires_grad = False
+        self.pe.to(self.tparams.dtype)
         self.pe = self.pe.to(self.tparams.device)
         # import pdb; pdb.set_trace()
 
     def pack(self, x):
         return rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)",
                          ph=self.tparams.feature_size, pw=self.tparams.feature_size)
+
+    def pack_vae(self, x):
+        """
+            x shape b,c,h,w
+        """
+        assert self.vae is not None, "VAE is not loaded!"
+        assert not self.vae.training, "VAE is still training!"
+        b, c, h, w = x.shape
+        assert c == 3, "Input must be RGB Image"
+        x = self.vae.encode(x)
+        x = rearrange(x, "b c h w -> b (h w) c")
+        return x
 
     def unpack(self, x: Tensor) -> Tensor:
         return rearrange(
@@ -155,16 +184,33 @@ class RF(l.LightningModule):
             pw=self.tparams.feature_size,
         )
 
+    def unpack_vae(self, x: Tensor) -> Tensor:
+        """
+            x shape b, n, d
+        """
+        assert self.vae is not None, "VAE is not loaded!"
+        assert not self.vae.training, "VAE is still training!"
+        b, n, d = x.shape
+        Z = self.tparams.Z
+        x = rearrange(x, "b (h w) d -> b d h w", h=Z, w=Z)
+        return self.vae.decode(x)
+
     def configure_optimizers(self):
         return torch.optim.AdamW(self.model.parameters(), lr=self.tparams.lr)
 
     def prepare(self, batch, batch_idx):
         in_img, out_img = batch
-        token_y = self.pack(in_img)  # b, 3, H, W
-        token_x = self.pack(out_img)  # b, 1, H, W
+        if self.vae is not None:
+            out_img = out_img.repeat(1, 3, 1, 1)
+            token_y = self.pack_vae(in_img)
+            token_x = self.pack_vae(out_img)
+        else:
+            token_y = self.pack(in_img)  # b, 3, H, W
+            token_x = self.pack(out_img)  # b, 1, H, W
 
+        curr_epoch = self.current_epoch
         b, n, d = token_x.shape
-        ts = get_ts(b, True, token_x.device)
+        ts = get_ts(b, token_x.device, True, curr_epoch > 100)
         texp = ts.view([b, *([1] * len(token_x.shape[1:]))])
 
         z1 = torch.randn_like(token_x)
@@ -189,54 +235,6 @@ class RF(l.LightningModule):
         self.log('train_loss', loss, prog_bar=True, sync_dist=True)
         return loss
 
-    def validation_step(self, batch, batch_idx):
-        assert not self.model.training, "Model is still training!"
-        z1, zt, token_y, token_x, ts, pe = self.prepare(batch, batch_idx)
-        epoch = self.current_epoch
-        with torch.no_grad():
-            vtheta = self.model(img=zt, img_cond=token_y, pe=pe, timesteps=ts)
-            batchwise_mse = ((z1 - token_x - vtheta) ** 2).mean(dim=list(range(1, len(token_x.shape))))
-            loss = batchwise_mse.mean()
-            self.log('val_loss', loss.item(), prog_bar=True, sync_dist=True)
-
-            # if epoch % 10 == 0:
-            #     tlist = batchwise_mse.detach().cpu().reshape(-1).tolist()
-            #     bins = ts.detach().cpu().numpy().tolist()
-
-            #     data = list(zip(bins, tlist))
-            #     table = wandb.Table(data=data, columns=["ts", "loss"])
-            #     self.logger.experiment.log({f"Losses:{epoch}": wandb.plot.line(
-            #         table, "ts", "loss", title=f"time vs loss {epoch}"
-            #     )})
-        return loss
-
-    # @torch.no_grad()
-    # def denoise(self, x: Tensor, y: Tensor, guidance, timesteps: list[float]):
-    #     for i in tqdm(range(len(timesteps) - 1), desc="Denoising"):
-    #         t_curr, t_prev = timesteps[i], timesteps[i + 1]
-    #         # for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
-    #         t_vec = torch.full((x.shape[0],), t_curr, dtype=x.dtype, device=x.device)
-    #         v = self.model(img=x, img_cond=y, pe=self.pe, timesteps=t_vec, guidance=guidance)
-    #         x = x + v * (t_prev - t_curr)
-    #     return x
-    #
-    # @torch.no_grad()
-    # def generate(self, y: Tensor, timesteps: list[float] | None, seed: int):
-    #     b, c, h, w = y.shape
-    #     assert c == 3, "Input must be RGB Image"
-    #     assert h == self.tparams.H and w == self.tparams.W, "Input shape must match model input shape"
-    #     x = get_noise(b, self.tparams.in_channels, h, w, y.device, y.dtype, seed)
-    #
-    #     token_x = self.pack(x)
-    #     token_y = self.pack(y)
-    #
-    #     if timesteps is None:
-    #         timesteps = torch.linspace(1, 0, 100)
-    #         timesteps = torch.sigmoid(11 * (timesteps - 0.5))  # do we need this ?
-    #
-    #     x = self.denoise(token_x, token_y, None, timesteps)
-    #     return self.unpack(x)
-
 
 class GenerateCallback(Callback):
     def __init__(self, imgs: Tensor, out_imgs: Tensor, timesteps: list[float] | None, seed: int):
@@ -248,8 +246,13 @@ class GenerateCallback(Callback):
 
     @staticmethod
     def prepare(rf, cond_img, out_img):
-        token_y = rf.pack(cond_img)  # b, 3, H, W
-        token_x = rf.pack(out_img)  # b, 1, H, W
+        if rf.vae is not None:
+            out_img = out_img.repeat(1, 3, 1, 1)
+            token_y = rf.pack_vae(cond_img)
+            token_x = rf.pack_vae(out_img)
+        else:
+            token_y = rf.pack(cond_img)  # b, 3, H, W
+            token_x = rf.pack(out_img)  # b, 1, H, W
         token_z1 = torch.randn_like(token_x) #rf.pack(z1)  # b, 1, H, W
 
         b, _, _ = token_x.shape
@@ -264,13 +267,19 @@ class GenerateCallback(Callback):
 
     @staticmethod
     def to_img(rf, l):
-        l = l - l.min()
-        l = l / l.max()
-        return rf.unpack(l)
+        if rf.vae is None:
+            l = l - l.min()
+            l = l / l.max()
+            return rf.unpack(l)
+        else:
+            l = rf.unpack_vae(l).clip(0, 1)
+        return l
 
     def on_train_epoch_end(self, trainer, pl_module):
         pl_module.model.eval()
         epoch = trainer.current_epoch
+        device_id = pl_module.device.index if torch.cuda.is_available() else "cpu"
+        print(f'Device: {pl_module.device}, {device_id}')
         with torch.no_grad():
             if trainer.current_epoch % 10 == 0:
                 x, y = self.x.to(pl_module.device), self.y.to(pl_module.device)
@@ -297,17 +306,11 @@ class GenerateCallback(Callback):
                 grid = torch.cat((y, x, zt_img), dim=0)
                 out = torchvision.utils.make_grid(grid, nrow=grid.shape[0] // 3, pad_value=1)
 
-                rand_id = x.get_device()
-                trainer.logger.experiment.log({f"Gen:{epoch}:{rand_id}": wandb.Image(out, caption="Generated Images")})
-                # # log losses plot in wandb
-                plt_img = plot_line(timesteps[:-1], losses, "Time", "Loss")
-                trainer.logger.experiment.log({f"Losses:{epoch}:{rand_id}": wandb.Image(plt_img, caption="Losses Plot")})
-
-
-                # trainer.logger.experiment.log({f"Losses:{epoch}": wandb.plot.line(
-                #     wandb.Table(data=list(zip(timesteps[:-1], losses)), columns=["ts", "loss"]),
-                #     "ts", "loss", title=f"time vs loss {epoch}"
-                # )})
+                # rand_id = x.get_device()
+                # trainer.logger.experiment.log({f"Gen:{epoch}:{device_id}": wandb.Image(out, caption="Generated Images")})
+                # # # log losses plot in wandb
+                # plt_img = plot_line(timesteps[:-1], losses, "Time", "Loss")
+                # trainer.logger.experiment.log({f"Losses:{epoch}:{device_id}": wandb.Image(plt_img, caption="Losses Plot")})
 
         pl_module.model.train()
 
@@ -315,8 +318,8 @@ class GenerateCallback(Callback):
 device = torch.device("cuda") if torch.cuda.is_available() else (
     torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu"))
 dtype = torch.float32  # torch.bfloat16 if torch.cuda.is_available() else torch.float32
-head = '/Users/souymodip/GIT/pythonProject/' #'/home/souchakr/sensei-fs-symlink/users/souchakr/localssd'  #
-folder_path = f'{head}/data_seg'
+head = '/Users/souymodip/GIT/SvgDataGen' #'/home/souchakr/sensei-fs-symlink/users/souchakr/localssd'  #
+folder_path = f'{head}/data_seg_val'
 val_path = f'{head}/data_seg_val'
 num_workers = 8  # 1
 
@@ -324,12 +327,13 @@ train_params = TrainParams(
     batch_size=2,
     epochs=420000,
     lr=1e-4,
-    H=32,
-    W=32,
+    H=128,
+    W=128,
+    Z=16,
     seed=42,
-    in_channels=1,
-    cond_channels=3,
-    feature_size=2,
+    in_channels=16,
+    cond_channels=16,
+    feature_size=1,
     device=device,
     dtype=dtype
 )
@@ -365,22 +369,25 @@ def train():
         mc,
         GenerateCallback(x, y, None, 42)
     ]
-    wandb_logger = WandbLogger(project="DiTEdge")
+    # wandb_logger = WandbLogger(project="DiTEdge")
 
     trainer = l.Trainer(accelerator="gpu", devices="auto", strategy="auto",
                         callbacks=cb,
-                        logger=wandb_logger,
-                        max_epochs=1, limit_train_batches=1
+                        # logger=wandb_logger, max_epochs=train_params.epochs, accumulate_grad_batches=8,
+                        max_epochs=1, limit_train_batches=1,
                         # val_check_interval=0.5
                         )
+    vae = load_ae("flux-schnell", device)
+    vae.eval()
 
-    ckpt_path = '/Users/souymodip/Downloads/sstep=00077625-ltrain_loss=0.005.ckpt' #'/sensei-fs/users/souchakr/RF/src/DiTEdge/2pgkchff/checkpoints/epoch=124-step=128000.ckpt'  # '/Users/souymodip/GIT/flux/CKPT/checkpoints/epoch=124-step=128000.ckpt'
+    ckpt_path = None # '/Users/souymodip/Downloads/sstep=00077625-ltrain_loss=0.005.ckpt' #'/sensei-fs/users/souchakr/RF/src/DiTEdge/2pgkchff/checkpoints/epoch=124-step=128000.ckpt'  # '/Users/souymodip/GIT/flux/CKPT/checkpoints/epoch=124-step=128000.ckpt'
     if ckpt_path:
         print(f"Loading Checkpoint from {ckpt_path}")
-        rf = RF.load_from_checkpoint(ckpt_path, model=FluxImg(fparams), fluxparams=fparams, trainparams=train_params)
+        rf = RF.load_from_checkpoint(ckpt_path, model=FluxImg(fparams), vae=vae, fluxparams=fparams, trainparams=train_params)
         rf.setup("train")
     else:
-        rf = RF(FluxImg(fparams), fparams, train_params)
+        rf = RF(model=FluxImg(fparams), vae=vae,
+                fluxparams=fparams, trainparams=train_params)
 
     trainer.fit(rf, data)
     print('Training Completed!')

@@ -19,6 +19,7 @@ def test(img):
     name = "flux-schnell"
     device = "cpu"
     ae_model = util.load_ae(name, device)
+    ae_model.eval()
     # img = torch.randn(1, 3, 128, 128)
     import pdb; pdb.set_trace()
     b, c, h, w = img.shape

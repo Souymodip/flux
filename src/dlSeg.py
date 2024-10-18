@@ -88,10 +88,10 @@ def get_val_loader(folder_path, size, dtype, batch_size, num_workers):
 
 def test():
     import matplotlib.pyplot as plt
-    head = '/Users/souymodip/GIT/pythonProject/' # '/home/souchakr/sensei-fs-symlink/users/souchakr/localssd' #
+    head = '/Users/souymodip/GIT/SvgDataGen/' # '/home/souchakr/sensei-fs-symlink/users/souchakr/localssd' #
     folder_path = f'{head}/data_seg_val'
     val_path = f'{head}/data_seg_val'
-    train_loader = get_train_loader(folder_path=folder_path, size=32,
+    train_loader = get_train_loader(folder_path=folder_path, size=128,
                                     batch_size=1, num_workers=1, dtype=torch.float32)
     print(f'Number of mini batche: {len(train_loader)}')
     # import pdb; pdb.set_trace()
