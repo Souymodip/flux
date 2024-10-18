@@ -297,10 +297,11 @@ class GenerateCallback(Callback):
                 grid = torch.cat((y, x, zt_img), dim=0)
                 out = torchvision.utils.make_grid(grid, nrow=grid.shape[0] // 3, pad_value=1)
 
-                trainer.logger.experiment.log({f"Gen:{epoch}": wandb.Image(out, caption="Generated Images")})
+                rand_id = x.get_device()
+                trainer.logger.experiment.log({f"Gen:{epoch}:{rand_id}": wandb.Image(out, caption="Generated Images")})
                 # # log losses plot in wandb
                 plt_img = plot_line(timesteps[:-1], losses, "Time", "Loss")
-                trainer.logger.experiment.log({f"Losses:{epoch}": wandb.Image(plt_img, caption="Losses Plot")})
+                trainer.logger.experiment.log({f"Losses:{epoch}:{rand_id}": wandb.Image(plt_img, caption="Losses Plot")})
 
 
                 # trainer.logger.experiment.log({f"Losses:{epoch}": wandb.plot.line(
